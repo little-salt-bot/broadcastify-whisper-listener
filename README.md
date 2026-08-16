@@ -31,6 +31,20 @@ docker run -d \
   broadcastify-whisper-listener 41286 --model medium --log /app/logs/scanner.log
 ```
 
+### Multiple feeds (one container, shared Whisper model)
+
+Pass multiple feed IDs — they share a single Whisper model in memory, so adding feeds costs little extra RAM:
+
+```bash
+docker run -d \
+  --name bcfy-listener \
+  -v bcfy-cache:/app/.cache \
+  -v bcfy-logs:/app/logs \
+  broadcastify-whisper-listener 41286 1 32602 --model medium --log /app/logs/scanner.log
+```
+
+Each transcript is tagged with its feed: `[2026-08-16 15:20:01] [feed 1] 3-5-1-1-2-3-5-9-go ahead`
+
 ### Bare metal
 
 ```bash
@@ -42,12 +56,12 @@ python scanner.py 41286 --model medium
 ## Usage
 
 ```
-python scanner.py FEED_ID [options]
+python scanner.py FEED_ID [FEED_ID ...] [options]
 ```
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `FEED_ID` | (required) | Broadcastify feed ID, e.g. `41286` |
+| `FEED_ID ...` | (required) | One or more Broadcastify feed IDs, e.g. `41286 1 32602` |
 | `--model` | `small` | Whisper model size: `tiny`, `base`, `small`, `medium`, `large-v3` |
 | `--device` | `auto` | `auto`, `cpu`, or `cuda` |
 | `--log` | `scanner.log` | Output log file path |

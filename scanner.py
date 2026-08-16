@@ -1,14 +1,17 @@
 #!/usr/bin/env python3
-"""Stream a Broadcastify scanner feed and transcribe each transmission with Whisper.
+"""Stream one or more Broadcastify scanner feeds and transcribe each transmission.
 
 Broadcastify now serves audio as HLS and requires HTTP/2 (HTTP/1.1 gets 403).
 So we fetch the m3u8 + .ts segments with httpx (HTTP/2), decode them locally
 with ffmpeg (stdin, no network), and run VAD + Whisper per transmission.
 
+Multiple feeds share a single Whisper model in memory (one model, N feeds),
+so adding feeds costs little RAM beyond the per-feed audio buffers.
+
 Usage:
     pip install faster-whisper webrtcvad-wheels numpy httpx[http2]
     apt install ffmpeg
-    python3 scanner.py 41286
+    python3 scanner.py 41286 1 32602
 """
 import argparse
 import datetime
@@ -59,9 +62,23 @@ def decode_pcm(segments: list[bytes]) -> bytes:
     return ff.stdout.read()
 
 
+def new_feed_state():
+    """Per-feed streaming state (buffer, VAD, seen segments)."""
+    return {
+        "client": httpx.Client(http2=True, headers={"User-Agent": UA}, timeout=30),
+        "seen": set(),
+        "buf": b"",
+        "speech": b"",
+        "silence_frames": 0,
+        "in_tx": False,
+        "tx_start_ts": None,
+    }
+
+
 def main():
-    ap = argparse.ArgumentParser(description="Transcribe a Broadcastify scanner feed")
-    ap.add_argument("feed_id", help="Broadcastify feed ID (e.g. 41286)")
+    ap = argparse.ArgumentParser(description="Transcribe Broadcastify scanner feeds")
+    ap.add_argument("feed_ids", nargs="+", type=int,
+                    help="Broadcastify feed IDs, e.g. 41286 1 32602")
     ap.add_argument("--model", default="small", help="Whisper model size (tiny/base/small/medium)")
     ap.add_argument("--device", default="auto", help="auto/cpu/cuda")
     ap.add_argument("--log", default="scanner.log", help="output log file")
@@ -72,101 +89,95 @@ def main():
     model = WhisperModel(args.model, device=args.device, compute_type="int8")
     vad = webrtcvad.Vad(2)
 
-    client = httpx.Client(http2=True, headers={"User-Agent": UA}, timeout=30)
-
-    def transcribe(audio: bytes, stream_ts: datetime.datetime):
+    def transcribe(feed_id: int, audio: bytes, stream_ts: datetime.datetime):
         samples = np.frombuffer(audio, dtype=np.int16).astype(np.float32) / 32768.0
         segments, _ = model.transcribe(samples, beam_size=5, vad_filter=True)
         text = " ".join(s.text.strip() for s in segments).strip()
         if text:
             ts = stream_ts.strftime("%Y-%m-%d %H:%M:%S")
-            line = f"[{ts}] {text}"
+            line = f"[{ts}] [feed {feed_id}] {text}"
             print(line, flush=True)
             with open(args.log, "a") as f:
                 f.write(line + "\n")
 
-    print(f"Listening to feed {args.feed_id} ... (Ctrl-C to stop)", flush=True)
-
-    seen = set()
-    buf = b""
-    speech = b""
-    silence_frames = 0
-    in_tx = False
-    tx_start_ts = None  # wall-clock time the current transmission began
+    feeds = {fid: new_feed_state() for fid in args.feed_ids}
+    print(f"Listening to feeds {args.feed_ids} ... (Ctrl-C to stop)", flush=True)
 
     try:
         while True:
-            try:
-                base, playlist = get_playlist(client, args.feed_id)
-                seg_urls = get_segments(client, base, playlist)
-            except httpx.HTTPStatusError as e:
-                if e.response.status_code == 429:
-                    time.sleep(5)  # rate limited — back off
-                else:
-                    print(f"playlist error: {e}", flush=True)
-                    time.sleep(2)
-                continue
-            except Exception as e:
-                print(f"playlist error: {e}", flush=True)
-                time.sleep(2)
-                continue
-
-            new_segs = [u for u in seg_urls if u not in seen]
-            if not new_segs:
-                time.sleep(5)  # no new segments yet — wait for the next window
-                continue
-
-            # fetch new segments
-            seg_data = []
-            for u in new_segs:
+            for feed_id, st in feeds.items():
+                # fetch playlist
                 try:
-                    r = client.get(u)
-                    if r.status_code == 200 and r.content[:1] == b"\x47":  # TS sync byte
-                        seg_data.append(r.content)
-                        seen.add(u)
-                    time.sleep(0.3)  # don't hammer segment fetches
-                except Exception:
-                    pass
+                    base, playlist = get_playlist(st["client"], feed_id)
+                    seg_urls = get_segments(st["client"], base, playlist)
+                except httpx.HTTPStatusError as e:
+                    if e.response.status_code == 429:
+                        time.sleep(5)  # rate limited — back off
+                    else:
+                        print(f"feed {feed_id} playlist error: {e}", flush=True)
+                        time.sleep(2)
+                    continue
+                except Exception as e:
+                    print(f"feed {feed_id} playlist error: {e}", flush=True)
+                    time.sleep(2)
+                    continue
 
-            if not seg_data:
-                time.sleep(5)
-                continue
+                new_segs = [u for u in seg_urls if u not in st["seen"]]
+                if not new_segs:
+                    continue
 
-            pcm = decode_pcm(seg_data)
-            if not pcm:
-                print("WARN: decoded 0 bytes", flush=True)
-                time.sleep(5)
-                continue
-            buf += pcm
+                # fetch new segments
+                seg_data = []
+                for u in new_segs:
+                    try:
+                        r = st["client"].get(u)
+                        if r.status_code == 200 and r.content[:1] == b"\x47":  # TS sync byte
+                            seg_data.append(r.content)
+                            st["seen"].add(u)
+                        time.sleep(0.3)  # don't hammer segment fetches
+                    except Exception:
+                        pass
 
-            # VAD segmentation
-            while len(buf) >= FRAME_BYTES:
-                frame = buf[:FRAME_BYTES]
-                buf = buf[FRAME_BYTES:]
-                if vad.is_speech(frame, SAMPLE_RATE):
-                    if not in_tx:
-                        tx_start_ts = datetime.datetime.now()  # stream time of first speech
-                    speech += frame
-                    silence_frames = 0
-                    in_tx = True
-                elif in_tx:
-                    speech += frame
-                    silence_frames += 1
-                    if silence_frames * FRAME_MS >= args.silence_ms:
-                        transcribe(speech, tx_start_ts)
-                        speech = b""
-                        in_tx = False
-                        silence_frames = 0
-                        tx_start_ts = None
+                if not seg_data:
+                    continue
 
-            # keep seen bounded
-            if len(seen) > 200:
-                seen = set(list(seen)[-100:])
+                pcm = decode_pcm(seg_data)
+                if not pcm:
+                    print(f"feed {feed_id} WARN: decoded 0 bytes", flush=True)
+                    continue
+                st["buf"] += pcm
+
+                # VAD segmentation
+                while len(st["buf"]) >= FRAME_BYTES:
+                    frame = st["buf"][:FRAME_BYTES]
+                    st["buf"] = st["buf"][FRAME_BYTES:]
+                    if vad.is_speech(frame, SAMPLE_RATE):
+                        if not st["in_tx"]:
+                            st["tx_start_ts"] = datetime.datetime.now()  # stream time of first speech
+                        st["speech"] += frame
+                        st["silence_frames"] = 0
+                        st["in_tx"] = True
+                    elif st["in_tx"]:
+                        st["speech"] += frame
+                        st["silence_frames"] += 1
+                        if st["silence_frames"] * FRAME_MS >= args.silence_ms:
+                            transcribe(feed_id, st["speech"], st["tx_start_ts"])
+                            st["speech"] = b""
+                            st["in_tx"] = False
+                            st["silence_frames"] = 0
+                            st["tx_start_ts"] = None
+
+                # keep seen bounded
+                if len(st["seen"]) > 200:
+                    st["seen"] = set(list(st["seen"])[-100:])
+
+            time.sleep(1)  # pace the round-robin across feeds
 
     except KeyboardInterrupt:
         pass
     finally:
-        client.close()
+        for st in feeds.values():
+            st["client"].close()
 
 
 if __name__ == "__main__":
