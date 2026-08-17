@@ -61,17 +61,35 @@ def decode_pcm(segments: list[bytes]) -> bytes:
     return ff.communicate(b"".join(segments))[0]
 
 
-def save_wav(path: str, pcm: bytes) -> None:
-    """Write 16kHz mono 16-bit PCM as a WAV file (for later verification)."""
-    with open(path, "wb") as f:
-        f.write(b"RIFF")
-        f.write(struct.pack("<I", 36 + len(pcm)))
-        f.write(b"WAVEfmt ")
-        f.write(struct.pack("<IHHIIHH", 16, 1, 1, SAMPLE_RATE,
-                            SAMPLE_RATE * 2, 2, 16))
-        f.write(b"data")
-        f.write(struct.pack("<I", len(pcm)))
-        f.write(pcm)
+def open_wav(path: str):
+    """Open a new streaming WAV for appending PCM; sizes patched on close."""
+    f = open(path, "wb")
+    f.write(b"RIFF")
+    f.write(struct.pack("<I", 36))
+    f.write(b"WAVEfmt ")
+    f.write(struct.pack("<IHHIIHH", 16, 1, 1, SAMPLE_RATE,
+                        SAMPLE_RATE * 2, 2, 16))
+    f.write(b"data")
+    f.write(struct.pack("<I", 0))
+    f.flush()
+    return f
+
+
+def finalize_wav(f, path: str) -> None:
+    """Patch the RIFF/data sizes in a streamed WAV and close it."""
+    n = f.tell()
+    f.seek(4)
+    f.write(struct.pack("<I", n - 8))
+    f.seek(40)
+    f.write(struct.pack("<I", n - 44))
+    f.close()
+
+
+def chunk_start(now: datetime.datetime) -> datetime.datetime:
+    """Round a time down to the last :00 or :30 boundary."""
+    if now.minute < 30:
+        return now.replace(minute=0, second=0, microsecond=0)
+    return now.replace(minute=30, second=0, microsecond=0)
 
 
 def new_feed_state():
@@ -84,7 +102,41 @@ def new_feed_state():
         "silence_frames": 0,
         "in_tx": False,
         "tx_start_ts": None,
+        "rec_f": None,       # open WAV handle for current 30-min chunk
+        "rec_path": None,    # path of current chunk
+        "rec_start": None,   # datetime of current chunk boundary
     }
+
+
+class ChunkRecorder:
+    """Writes continuous per-feed audio into :00/:30 WAV chunks."""
+
+    def __init__(self, record_dir: str):
+        self.dir = record_dir
+        os.makedirs(self.dir, exist_ok=True)
+
+    def _roll(self, st, feed_id: int, now: datetime.datetime):
+        """Close the current chunk and open a new one if the boundary passed."""
+        start = chunk_start(now)
+        if st["rec_f"] is not None and st["rec_start"] == start:
+            return
+        if st["rec_f"] is not None:  # finalize the finished chunk
+            finalize_wav(st["rec_f"], st["rec_path"])
+        path = os.path.join(self.dir, f"feed_{feed_id}_{start:%Y%m%d_%H%M}.wav")
+        st["rec_f"] = open_wav(path)
+        st["rec_path"] = path
+        st["rec_start"] = start
+
+    def write(self, st, feed_id: int, pcm: bytes):
+        if not pcm:
+            return
+        self._roll(st, feed_id, datetime.datetime.now())
+        st["rec_f"].write(pcm)
+
+    def close(self, st):
+        if st["rec_f"] is not None:
+            finalize_wav(st["rec_f"], st["rec_path"])
+            st["rec_f"] = None
 
 
 def main():
@@ -126,13 +178,9 @@ def main():
             print(f"[{name}] {line}", flush=True)
             with open(os.path.join(args.log_dir, f"feed_{feed_id}.log"), "a") as f:
                 f.write(line + "\n")
-            if args.record_dir:
-                os.makedirs(args.record_dir, exist_ok=True)
-                save_wav(os.path.join(args.record_dir,
-                                      f"feed_{feed_id}_{stream_ts:%Y%m%d_%H%M%S}.wav"),
-                         audio)
 
     feeds = {fid: new_feed_state() for fid in args.feed_ids}
+    recorder = ChunkRecorder(args.record_dir) if args.record_dir else None
     print(f"Listening to feeds {args.feed_ids} ... (Ctrl-C to stop)", flush=True)
 
     try:
@@ -177,6 +225,8 @@ def main():
                 if not pcm:
                     print(f"feed {feed_id} WARN: decoded 0 bytes", flush=True)
                     continue
+                if recorder:
+                    recorder.write(feeds[feed_id], feed_id, pcm)
                 st["buf"] += pcm
 
                 # VAD segmentation
@@ -208,6 +258,9 @@ def main():
     except KeyboardInterrupt:
         pass
     finally:
+        if recorder:
+            for st in feeds.values():
+                recorder.close(st)
         for st in feeds.values():
             st["client"].close()
 

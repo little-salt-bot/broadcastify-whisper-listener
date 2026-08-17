@@ -20,9 +20,10 @@ services:
     environment:
       - TZ=America/New_York
     entrypoint: ["python", "dashboard.py"]
-    command: ["--log-dir", "/app/logs", "--feed-names", "41286:Bedford County,40761:Lynchburg Fire", "--port", "8095"]
+    command: ["--log-dir", "/app/logs", "--feed-names", "41286:Bedford County,40761:Lynchburg Fire", "--port", "8095", "--record-dir", "/app/recordings"]
     volumes:
       - bcfy-logs:/app/logs
+      - bcfy-recordings:/app/recordings
     networks:
       - traefik-net
 

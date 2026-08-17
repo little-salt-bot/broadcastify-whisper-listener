@@ -12,10 +12,11 @@ import argparse
 import glob
 import os
 
-from flask import Flask, jsonify, render_template_string
+from flask import Flask, jsonify, render_template_string, request, send_file
 
 app = Flask(__name__)
 LOG_DIR = "logs"
+RECORD_DIR = None
 FEED_NAMES = {}
 
 
@@ -43,30 +44,83 @@ def discover_feeds():
     return feeds
 
 
-def read_log(path, limit=200):
-    """Read the last `limit` lines of a log file."""
+def read_log(path, limit=200, date=None, page=0):
+    """Read log lines, optionally filtered to a date and paginated backwards.
+
+    date (YYYY-MM-DD): only keep lines on that day (prefix match).
+    page: 0 = latest `limit` lines of that day, 1 = the `limit` before,
+          etc. page=-1 means "no pagination, just last `limit` overall"
+          (used by the live auto-refresh view).
+    Returns (text, has_more) where has_more is True if older lines remain.
+    """
     try:
         with open(path, "r") as f:
             lines = f.readlines()
-        return "".join(lines[-limit:])
     except FileNotFoundError:
-        return ""
+        return "", False
+    if not lines:
+        return "", False
+    if date:
+        lines = [l for l in lines if l.startswith(f"[{date}")]
+    if page == -1:
+        return "".join(lines[-limit:]), False
+    # page 0 = latest; slice from the end
+    start = max(0, len(lines) - limit * (page + 1))
+    end = len(lines) - limit * page
+    has_more = start > 0
+    return "".join(lines[start:end]), has_more
 
 
 @app.route("/")
 def index():
     feeds = discover_feeds()
-    return render_template_string(HTML, feeds=feeds)
+    return render_template_string(HTML, feeds=feeds, record_dir=RECORD_DIR)
+
+
+@app.route("/api/recordings/<date>")
+def api_recordings(date):
+    """List recording chunks for a date (YYYY-MM-DD)."""
+    if not RECORD_DIR:
+        return jsonify([])
+    files = sorted(glob.glob(os.path.join(RECORD_DIR, f"*_{date}_*.wav")))
+    out = []
+    for p in files:
+        name = os.path.basename(p)
+        out.append({
+            "name": name,
+            "size": os.path.getsize(p),
+            "url": f"/recordings/{name}",
+        })
+    return jsonify(out)
+
+
+@app.route("/recordings/<name>")
+def get_recording(name):
+    """Serve a recorded WAV chunk."""
+    if not RECORD_DIR or "/" in name or os.path.basename(name) != name:
+        return ("", 404)
+    p = os.path.join(RECORD_DIR, name)
+    if not os.path.exists(p):
+        return ("", 404)
+    return send_file(p, mimetype="audio/wav")
 
 
 @app.route("/api/feeds")
 def api_feeds():
+    date = request.args.get("date", "") or None
+    page = request.args.get("page", "0")
+    try:
+        page = int(page)
+    except ValueError:
+        page = 0
     feeds = []
     for f in discover_feeds():
+        text, has_more = read_log(f["log_path"], date=date, page=page)
         feeds.append({
             "id": f["id"],
             "name": f["name"],
-            "log": read_log(f["log_path"]),
+            "log": text,
+            "has_more": has_more,
         })
     return jsonify(feeds)
 
@@ -81,32 +135,83 @@ HTML = """
     body { font-family: -apple-system, system-ui, sans-serif; margin: 0; background: #0f1115; color: #e6e6e6; }
     header { padding: 16px 24px; background: #161a22; border-bottom: 1px solid #2a2f3a; }
     h1 { margin: 0; font-size: 20px; }
-    .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(380px, 1fr)); gap: 16px; padding: 24px; }
-    .channel { background: #161a22; border: 1px solid #2a2f3a; border-radius: 8px; overflow: hidden; }
+    .controls { padding: 16px 24px; background: #161a22; border-bottom: 1px solid #2a2f3a; display: flex; gap: 24px; align-items: center; flex-wrap: wrap; }
+    .controls label { font-size: 14px; color: #9aa0a6; display: flex; align-items: center; gap: 8px; }
+    .controls input { background: #0f1115; color: #e6e6e6; border: 1px solid #2a2f3a; padding: 6px 10px; border-radius: 6px; font-size: 14px; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(420px, 1fr)); gap: 16px; padding: 24px; }
+    .channel { background: #161a22; border: 1px solid #2a2f3a; border-radius: 8px; overflow: hidden; display: flex; flex-direction: column; }
     .channel h2 { margin: 0; padding: 12px 16px; font-size: 15px; background: #1c212b; border-bottom: 1px solid #2a2f3a; }
-    .channel pre { margin: 0; padding: 12px 16px; font-size: 13px; line-height: 1.5; white-space: pre-wrap; word-wrap: break-word; max-height: 500px; overflow-y: auto; }
+    .channel pre { margin: 0; padding: 12px 16px; font-size: 13px; line-height: 1.5; white-space: pre-wrap; word-wrap: break-word; height: 420px; overflow-y: auto; box-sizing: border-box; }
     .empty { color: #6b7280; font-style: italic; }
-    .updated { color: #6b7280; font-size: 12px; padding: 8px 16px; border-top: 1px solid #2a2f3a; }
+    .foot { color: #6b7280; font-size: 12px; padding: 8px 16px; border-top: 1px solid #2a2f3a; display: flex; justify-content: space-between; align-items: center; }
+    .foot button { background: #1c212b; color: #e6e6e6; border: 1px solid #2a2f3a; padding: 4px 10px; border-radius: 6px; cursor: pointer; font-size: 12px; }
+    .foot button:disabled { opacity: 0.4; cursor: default; }
+    .rec-list { list-style: none; margin: 0; padding: 0; display: flex; flex-wrap: wrap; gap: 8px; }
+    .rec-list li { background: #1c212b; border: 1px solid #2a2f3a; border-radius: 6px; padding: 8px 12px; font-size: 13px; }
+    .rec-list audio { display: block; margin-top: 6px; height: 32px; }
+    .rec-meta { color: #6b7280; font-size: 11px; margin-top: 4px; }
+    .hidden { display: none; }
   </style>
 </head>
 <body>
   <header><h1>Broadcastify Whisper Listener</h1></header>
+  <div class="controls">
+    <label>Date: <input type="date" id="datePicker"></label>
+    <label>Page: <button id="prevBtn">&#9664; Older</button> <span id="pageLabel">0</span></label>
+  </div>
+  <div class="controls" id="recPanel">
+    <h2 style="margin:0;font-size:15px;">Recordings</h2>
+    <ul class="rec-list" id="recList"></ul>
+  </div>
   <div class="grid" id="grid"></div>
   <script>
+    const datePicker = document.getElementById('datePicker');
+    const prevBtn = document.getElementById('prevBtn');
+    const pageLabel = document.getElementById('pageLabel');
+    let page = 0;
+
+    datePicker.value = new Date().toISOString().slice(0, 10);
+    datePicker.addEventListener('change', () => { page = 0; refresh(); loadRecordings(); });
+    prevBtn.addEventListener('click', () => { page += 1; refresh(); });
+
     async function refresh() {
-      const res = await fetch('/api/feeds');
+      const date = datePicker.value;
+      const res = await fetch('/api/feeds?date=' + date + '&page=' + page);
       const feeds = await res.json();
       const grid = document.getElementById('grid');
       grid.innerHTML = feeds.map(f => `
         <div class="channel">
           <h2>${f.name}</h2>
-          <pre>${f.log ? f.log.replace(/</g, '&lt;') : '<span class="empty">No transmissions yet</span>'}</pre>
-          <div class="updated">Updated ${new Date().toLocaleTimeString()}</div>
+          <pre>${f.log ? f.log.replace(/</g, '&lt;') : '<span class="empty">No transmissions this day</span>'}</pre>
+          <div class="foot">
+            <span>Updated ${new Date().toLocaleTimeString()}</span>
+            ${f.has_more ? '<button onclick="loadOlder()">Older &#9664;</button>' : ''}
+          </div>
         </div>
       `).join('');
+      pageLabel.textContent = page;
+      prevBtn.disabled = (page === 0);
     }
+
+    window.loadOlder = function() { page += 1; refresh(); };
+
+    async function loadRecordings() {
+      const date = datePicker.value;
+      const res = await fetch('/api/recordings/' + date);
+      const recs = await res.json();
+      const recList = document.getElementById('recList');
+      if (!recList) return;
+      recList.innerHTML = recs.length ? recs.map(r => `
+        <li>
+          <div>${r.name} <span class="rec-meta">(${(r.size/1024).toFixed(0)} KB)</span></div>
+          <audio controls preload="none" src="${r.url}"></audio>
+        </li>
+      `).join('') : '<li class="empty">No recordings for this date</li>';
+    }
+
     refresh();
-    setInterval(refresh, 5000);
+    loadRecordings();
+    setInterval(() => { if (page === 0) refresh(); }, 5000);
   </script>
 </body>
 </html>
@@ -114,15 +219,19 @@ HTML = """
 
 
 def main():
-    global LOG_DIR, FEED_NAMES
+    global LOG_DIR, FEED_NAMES, RECORD_DIR
     ap = argparse.ArgumentParser(description="Dashboard for Broadcastify Whisper Listener")
     ap.add_argument("--log-dir", default="logs", help="directory with per-feed log files")
     ap.add_argument("--feed-names", default="",
                     help="comma-separated feed_id:name pairs, e.g. 41286:Bedford,1:Phoenix")
     ap.add_argument("--port", type=int, default=8081)
+    ap.add_argument("--record-dir", default="",
+                    help="directory with recorded WAV chunks (feed_<id>_<YYYYMMDD_HHMM>.wav)")
     args = ap.parse_args()
 
     LOG_DIR = args.log_dir
+    if args.record_dir:
+        RECORD_DIR = args.record_dir
     for pair in args.feed_names.split(","):
         if ":" in pair:
             fid, name = pair.split(":", 1)
