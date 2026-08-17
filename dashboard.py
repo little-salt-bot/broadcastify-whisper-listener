@@ -10,7 +10,10 @@ Usage:
 """
 import argparse
 import glob
+import io
 import os
+import struct
+import wave
 from collections import deque
 
 from flask import Flask, jsonify, render_template_string, request, send_file
@@ -119,6 +122,51 @@ def get_recording(name):
     return send_file(p, mimetype="audio/wav", conditional=True)
 
 
+@app.route("/clip/<name>")
+def get_clip(name):
+    """Extract a short segment from a WAV chunk.
+
+    Query params: start (sec), end (sec). Returns a standalone WAV.
+    """
+    if not RECORD_DIR or "/" in name or os.path.basename(name) != name:
+        return ("", 404)
+    p = os.path.join(RECORD_DIR, name)
+    if not os.path.exists(p):
+        return ("", 404)
+    try:
+        start = max(0, float(request.args.get("start", 0)))
+        end = float(request.args.get("end", start + 4))
+    except ValueError:
+        return ("", 400)
+    if end <= start:
+        return ("", 400)
+
+    with wave.open(p, "rb") as wf:
+        rate = wf.getframerate()
+        channels = wf.getnchannels()
+        sampwidth = wf.getsampwidth()
+        total = wf.getnframes()
+        duration = total / rate
+        # clamp to actual file duration
+        start_frame = int(min(start, duration) * rate)
+        end_frame = int(min(end, duration) * rate)
+        if end_frame <= start_frame:
+            # timestamp is past end of this chunk — return what we have
+            end_frame = min(start_frame + int(4 * rate), total)
+            start_frame = max(0, end_frame - int(4 * rate))
+        wf.setpos(start_frame)
+        frames = wf.readframes(end_frame - start_frame)
+
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as out:
+        out.setframerate(rate)
+        out.setnchannels(channels)
+        out.setsampwidth(sampwidth)
+        out.writeframes(frames)
+    buf.seek(0)
+    return send_file(buf, mimetype="audio/wav", download_name=f"clip_{start:.0f}-{end:.0f}.wav")
+
+
 @app.route("/api/feeds")
 def api_feeds():
     date = request.args.get("date", "") or None
@@ -219,17 +267,13 @@ HTML = """
       const { chunk, offset } = tsToChunk(feedId, ts);
       const start = Math.max(0, offset - 2);
       const end = offset + 2;
-      const url = `/recordings/${chunk}.wav#t=${start},${end}`;
+      const url = `/clip/${chunk}.wav?start=${start}&end=${end}`;
       plabel.textContent = text.slice(0, 80);
       player.style.display = 'flex';
       paudio.src = url;
       paudio.load();
       paudio.onloadedmetadata = () => {
-        paudio.currentTime = start;
         paudio.play().catch(() => {});
-      };
-      paudio.ontimeupdate = () => {
-        if (paudio.currentTime >= end) { paudio.pause(); }
       };
     }
 
