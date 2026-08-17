@@ -16,6 +16,7 @@ Usage:
 import argparse
 import datetime
 import os
+import struct
 import subprocess
 import sys
 import time
@@ -60,6 +61,19 @@ def decode_pcm(segments: list[bytes]) -> bytes:
     return ff.communicate(b"".join(segments))[0]
 
 
+def save_wav(path: str, pcm: bytes) -> None:
+    """Write 16kHz mono 16-bit PCM as a WAV file (for later verification)."""
+    with open(path, "wb") as f:
+        f.write(b"RIFF")
+        f.write(struct.pack("<I", 36 + len(pcm)))
+        f.write(b"WAVEfmt ")
+        f.write(struct.pack("<IHHIIHH", 16, 1, 1, SAMPLE_RATE,
+                            SAMPLE_RATE * 2, 2, 16))
+        f.write(b"data")
+        f.write(struct.pack("<I", len(pcm)))
+        f.write(pcm)
+
+
 def new_feed_state():
     """Per-feed streaming state (buffer, VAD, seen segments)."""
     return {
@@ -84,6 +98,9 @@ def main():
                     help="comma-separated feed_id:name pairs, e.g. 41286:Bedford,1:Phoenix")
     ap.add_argument("--silence-ms", type=int, default=600,
                     help="silence (ms) that ends a transmission")
+    ap.add_argument("--record-dir", default="",
+                    help="if set, save each transmission's audio as a WAV here "
+                         "for later verification (feed_<id>_<ts>.wav)")
     args = ap.parse_args()
 
     # feed_id -> human name
@@ -109,6 +126,11 @@ def main():
             print(f"[{name}] {line}", flush=True)
             with open(os.path.join(args.log_dir, f"feed_{feed_id}.log"), "a") as f:
                 f.write(line + "\n")
+            if args.record_dir:
+                os.makedirs(args.record_dir, exist_ok=True)
+                save_wav(os.path.join(args.record_dir,
+                                      f"feed_{feed_id}_{stream_ts:%Y%m%d_%H%M%S}.wav"),
+                         audio)
 
     feeds = {fid: new_feed_state() for fid in args.feed_ids}
     print(f"Listening to feeds {args.feed_ids} ... (Ctrl-C to stop)", flush=True)

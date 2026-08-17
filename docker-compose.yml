@@ -5,10 +5,11 @@ services:
     restart: unless-stopped
     environment:
       - TZ=America/New_York
-    command: ["41286", "40761", "--model", "medium", "--log-dir", "/app/logs", "--feed-names", "41286:Bedford County,40761:Lynchburg Fire"]
+    command: ["41286", "40761", "--model", "medium", "--log-dir", "/app/logs", "--record-dir", "/app/recordings", "--feed-names", "41286:Bedford County,40761:Lynchburg Fire"]
     volumes:
       - bcfy-cache:/app/.cache
       - bcfy-logs:/app/logs
+      - bcfy-recordings:/app/recordings
     networks:
       - traefik-net
 
@@ -28,6 +29,7 @@ services:
 volumes:
   bcfy-cache:
   bcfy-logs:
+  bcfy-recordings:
 
 networks:
   traefik-net:
