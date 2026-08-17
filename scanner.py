@@ -113,9 +113,12 @@ def new_feed_state():
         "silence_frames": 0,
         "in_tx": False,
         "tx_start_ts": None,
+        "tx_start_chunk": None,   # recording chunk name when tx started
+        "tx_start_offset": 0,     # byte offset in chunk when tx started
         "rec_f": None,       # open WAV handle for current 30-min chunk
         "rec_path": None,    # path of current chunk
         "rec_start": None,   # datetime of current chunk boundary
+        "rec_last_ts": None, # wall-clock of last byte written to rec
     }
 
 
@@ -164,13 +167,25 @@ class ChunkRecorder:
         st["rec_f"] = open_wav(path)
         st["rec_path"] = path
         st["rec_start"] = start
+        st["rec_last_ts"] = None  # reset gap tracking for new chunk
         self._prune(path)
 
-    def write(self, st, feed_id: int, pcm: bytes):
+    def write(self, st, feed_id: int, pcm: bytes, now: datetime.datetime = None):
         if not pcm:
             return
-        self._roll(st, feed_id, datetime.datetime.now())
+        if now is None:
+            now = datetime.datetime.now()
+        self._roll(st, feed_id, now)
         st["rec_f"].write(pcm)
+        st["rec_last_ts"] = now
+
+    def pos(self, st):
+        """Return (chunk_name, data_byte_offset) of current write position."""
+        if st["rec_f"] is None or st["rec_path"] is None:
+            return (None, 0)
+        name = os.path.basename(st["rec_path"])
+        data_bytes = st["rec_f"].tell() - 44  # subtract WAV header
+        return (name, data_bytes)
 
     def close(self, st):
         if st["rec_f"] is not None:
@@ -210,7 +225,8 @@ def main():
     model = WhisperModel(args.model, device=args.device, compute_type="int8")
     vad = webrtcvad.Vad(2)
 
-    def transcribe(feed_id: int, audio: bytes, stream_ts: datetime.datetime):
+    def transcribe(feed_id: int, audio: bytes, stream_ts: datetime.datetime,
+                   rec_chunk: str = None, rec_offset: int = 0):
         samples = np.frombuffer(audio, dtype=np.int16).astype(np.float32) / 32768.0
         segments, _ = model.transcribe(samples, beam_size=5, vad_filter=True)
         segs = list(segments)
@@ -227,9 +243,11 @@ def main():
         # strongly when the model thinks there's no speech.
         conf = max(0.0, min(100.0, 100.0 * (1.0 + avg_lp) * (1.0 - ns)))
         if text:
+            dur = len(audio) / (SAMPLE_RATE * 2)  # seconds of speech
             ts = stream_ts.strftime("%Y-%m-%d %H:%M:%S")
             name = feed_names.get(feed_id, f"feed {feed_id}")
-            line = f"[{ts}] {text} confidence = {conf:.0f}/100"
+            loc = f" rec = {rec_chunk}:{rec_offset}" if rec_chunk else ""
+            line = f"[{ts}] {text} confidence = {conf:.0f}/100 dur = {dur:.1f}s{loc}"
             print(f"[{name}] {line}", flush=True)
             with open(os.path.join(args.log_dir, f"feed_{feed_id}.log"), "a") as f:
                 f.write(line + "\n")
@@ -292,6 +310,10 @@ def main():
                     if vad.is_speech(frame, SAMPLE_RATE):
                         if not st["in_tx"]:
                             st["tx_start_ts"] = datetime.datetime.now()  # stream time of first speech
+                            if recorder:
+                                chunk_name, byte_off = recorder.pos(st)
+                                st["tx_start_chunk"] = chunk_name
+                                st["tx_start_offset"] = byte_off
                         st["speech"] += frame
                         st["silence_frames"] = 0
                         st["in_tx"] = True
@@ -299,11 +321,14 @@ def main():
                         st["speech"] += frame
                         st["silence_frames"] += 1
                         if st["silence_frames"] * FRAME_MS >= args.silence_ms:
-                            transcribe(feed_id, st["speech"], st["tx_start_ts"])
+                            transcribe(feed_id, st["speech"], st["tx_start_ts"],
+                                       st["tx_start_chunk"], st["tx_start_offset"])
                             st["speech"] = b""
                             st["in_tx"] = False
                             st["silence_frames"] = 0
                             st["tx_start_ts"] = None
+                            st["tx_start_chunk"] = None
+                            st["tx_start_offset"] = 0
 
                 # keep seen bounded (evict oldest entries)
                 while len(st["seen"]) > 200:

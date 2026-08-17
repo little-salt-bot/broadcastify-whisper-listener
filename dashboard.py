@@ -126,36 +126,53 @@ def get_recording(name):
 def get_clip(name):
     """Extract a short segment from a WAV chunk.
 
-    Query params: start (sec), end (sec). Returns a standalone WAV.
+    Query params (time mode): start (sec), end (sec).
+    Query params (byte mode): offset (bytes), length (bytes).
+    Returns a standalone WAV.
     """
     if not RECORD_DIR or "/" in name or os.path.basename(name) != name:
         return ("", 404)
     p = os.path.join(RECORD_DIR, name)
     if not os.path.exists(p):
         return ("", 404)
-    try:
-        start = max(0, float(request.args.get("start", 0)))
-        end = float(request.args.get("end", start + 4))
-    except ValueError:
-        return ("", 400)
-    if end <= start:
-        return ("", 400)
 
     with wave.open(p, "rb") as wf:
         rate = wf.getframerate()
         channels = wf.getnchannels()
         sampwidth = wf.getsampwidth()
-        total = wf.getnframes()
-        duration = total / rate
-        # clamp to actual file duration
-        start_frame = int(min(start, duration) * rate)
-        end_frame = int(min(end, duration) * rate)
-        if end_frame <= start_frame:
-            # timestamp is past end of this chunk — return what we have
-            end_frame = min(start_frame + int(4 * rate), total)
-            start_frame = max(0, end_frame - int(4 * rate))
-        wf.setpos(start_frame)
-        frames = wf.readframes(end_frame - start_frame)
+
+        if "offset" in request.args:
+            # byte mode: extract by raw byte offset and length
+            try:
+                byte_off = int(request.args.get("offset", 0))
+                byte_len = int(request.args.get("length", 64000))
+            except ValueError:
+                return ("", 400)
+            # align to frame boundary (sampwidth * channels bytes per frame)
+            frame_size = sampwidth * channels
+            start_frame = (byte_off // frame_size) * frame_size // frame_size
+            wf.setpos(byte_off // frame_size)
+            total_frames = wf.getnframes()
+            n_frames = min(byte_len // frame_size, total_frames - (byte_off // frame_size))
+            frames = wf.readframes(n_frames)
+        else:
+            # time mode: extract by seconds
+            try:
+                start = max(0, float(request.args.get("start", 0)))
+                end = float(request.args.get("end", start + 4))
+            except ValueError:
+                return ("", 400)
+            if end <= start:
+                return ("", 400)
+            total = wf.getnframes()
+            duration = total / rate
+            start_frame = int(min(start, duration) * rate)
+            end_frame = int(min(end, duration) * rate)
+            if end_frame <= start_frame:
+                end_frame = min(start_frame + int(4 * rate), total)
+                start_frame = max(0, end_frame - int(4 * rate))
+            wf.setpos(start_frame)
+            frames = wf.readframes(end_frame - start_frame)
 
     # Write to temp file so send_file gets a real file with full seek support
     fd, tmp = tempfile.mkstemp(suffix=".wav")
@@ -170,6 +187,9 @@ def get_clip(name):
 
     @after_this_request
     def cleanup(response):
+        response.headers['Cache-Control'] = 'no-cache, no-store, must-revalidate'
+        response.headers['Pragma'] = 'no-cache'
+        response.headers['Expires'] = '0'
         try:
             os.unlink(tmp)
         except OSError:
@@ -354,11 +374,19 @@ HTML = """
       else { playStartOffset = seekTo; pbarFill.style.width = (pct*100)+'%'; ptime.textContent = fmtTime(seekTo) + ' / ' + fmtTime(clipDuration); }
     });
 
-    async function playClip(feedId, ts, text) {
-      const { chunk, offset } = tsToChunk(feedId, ts);
-      const start = Math.max(0, offset - 2);
-      const end = offset + 2;
-      const url = `/clip/${chunk}.wav?start=${start}&end=${end}`;
+    async function playClip(feedId, ts, dur, recChunk, recOffset, text) {
+      let url;
+      if (recChunk) {
+        // byte mode: exact audio from the recording
+        const byteLen = Math.ceil(dur * 16000 * 2); // 16kHz mono 16-bit
+        url = `/clip/${recChunk}?offset=${recOffset}&length=${byteLen}&_=${Date.now()}`;
+      } else {
+        // fallback: time mode (old log lines without rec=)
+        const { chunk, offset } = tsToChunk(feedId, ts);
+        const start = Math.max(0, offset - 0.5);
+        const end = offset + dur + 0.5;
+        url = `/clip/${chunk}.wav?start=${start}&end=${end}&_=${Date.now()}`;
+      }
       plabel.textContent = text.slice(0, 80);
       player.style.display = 'flex';
       stopPlayback();
@@ -367,6 +395,7 @@ HTML = """
       ptime.textContent = '0:00 / 0:00';
       pbarFill.style.width = '0%';
       currentSrc = url;
+      currentBuffer = null;
 
       try {
         if (!audioCtx) {
@@ -380,8 +409,6 @@ HTML = """
         pbtn.disabled = false;
         pbtn.innerHTML = '&#9654; Play';
         ptime.textContent = '0:00 / ' + fmtTime(clipDuration);
-        // autoplay
-        startPlayback(0);
       } catch(e) {
         pbtn.innerHTML = 'Error';
         ptime.textContent = 'Failed to load';
@@ -400,6 +427,12 @@ HTML = """
       const res = await fetch('/api/feeds?date=' + date + '&page=' + page);
       const feeds = await res.json();
       const grid = document.getElementById('grid');
+      // remember scroll positions
+      const scrollMap = {};
+      grid.querySelectorAll('pre').forEach(pre => {
+        const name = pre.previousElementSibling ? pre.previousElementSibling.textContent : '';
+        scrollMap[name] = { top: pre.scrollTop, atBottom: pre.scrollTop + pre.clientHeight >= pre.scrollHeight - 5 };
+      });
       grid.innerHTML = feeds.map(f => {
         if (!f.log) {
           return `<div class="channel">
@@ -408,14 +441,19 @@ HTML = """
             <div class="foot"><span>Updated ${new Date().toLocaleTimeString()}</span>${f.has_more ? '<button onclick="loadOlder()">Older &#9664;</button>' : ''}</div>
           </div>`;
         }
-        // parse each line: [YYYY-MM-DD HH:MM:SS] text confidence = N/100
+        // parse each line: [YYYY-MM-DD HH:MM:SS] text confidence = N/100 dur = N.Ns rec = chunk:offset
         const lines = f.log.split('\\n').filter(l => l.trim());
         const html = lines.map(l => {
           const m = l.match(/^\\[(\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}:\\d{2})\\]\\s*(.*)$/);
           if (!m) return `<span class="tline">${l.replace(/</g, '&lt;')}</span>`;
           const ts = m[1];
-          const text = m[2].replace(/</g, '&lt;');
-          return `<span class="tline" data-feed="${f.id}" data-ts="${ts}">${l.replace(/</g, '&lt;')}</span>`;
+          const rest = m[2];
+          const dm = rest.match(/dur\\s*=\\s*([\\d.]+)s/);
+          const dur = dm ? parseFloat(dm[1]) : 4;
+          const rm = rest.match(/rec\\s*=\\s*([^:]+):(\\d+)/);
+          const recChunk = rm ? rm[1] : '';
+          const recOffset = rm ? parseInt(rm[2]) : 0;
+          return `<span class="tline" data-feed="${f.id}" data-ts="${ts}" data-dur="${dur}" data-rec="${recChunk}" data-offset="${recOffset}">${l.replace(/</g, '&lt;')}</span>`;
         }).join('');
         return `<div class="channel">
           <h2>${f.name}</h2>
@@ -425,6 +463,16 @@ HTML = """
       }).join('');
       pageLabel.textContent = page;
       prevBtn.disabled = (page === 0);
+      // scroll each pre to bottom (newest at bottom) or restore position
+      grid.querySelectorAll('pre').forEach(pre => {
+        const name = pre.previousElementSibling ? pre.previousElementSibling.textContent : '';
+        const prev = scrollMap[name];
+        if (prev && !prev.atBottom) {
+          pre.scrollTop = prev.top;
+        } else {
+          pre.scrollTop = pre.scrollHeight;
+        }
+      });
     }
 
     window.loadOlder = function() { page += 1; refresh(); };
@@ -436,8 +484,11 @@ HTML = """
       el.classList.add('selected');
       const feedId = el.dataset.feed;
       const ts = el.dataset.ts;
-      const text = el.textContent.replace(/^\[.*?\]\s*/, '').slice(0, 80);
-      playClip(feedId, ts, text);
+      const dur = parseFloat(el.dataset.dur) || 4;
+      const recChunk = el.dataset.rec || '';
+      const recOffset = parseInt(el.dataset.offset) || 0;
+      const text = el.textContent.replace(/^\[.*?\]\s*/, '').replace(/dur\s*=\s*[\d.]+s/, '').replace(/rec\s*=\s*[^<]+/, '').slice(0, 80);
+      playClip(feedId, ts, dur, recChunk, recOffset, text);
     });
 
     async function loadRecordings() {
