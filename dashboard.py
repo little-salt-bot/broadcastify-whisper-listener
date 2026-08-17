@@ -164,7 +164,11 @@ def get_clip(name):
         out.setsampwidth(sampwidth)
         out.writeframes(frames)
     buf.seek(0)
-    return send_file(buf, mimetype="audio/wav", download_name=f"clip_{start:.0f}-{end:.0f}.wav")
+    return send_file(
+        buf,
+        mimetype="audio/wav",
+        as_attachment=False,
+    )
 
 
 @app.route("/api/feeds")
@@ -271,10 +275,7 @@ HTML = """
       plabel.textContent = text.slice(0, 80);
       player.style.display = 'flex';
       paudio.src = url;
-      paudio.load();
-      paudio.onloadedmetadata = () => {
-        paudio.play().catch(() => {});
-      };
+      paudio.play().catch(() => {});
     }
 
     window.closePlayer = function() {
