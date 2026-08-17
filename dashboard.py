@@ -10,18 +10,32 @@ Usage:
 """
 import argparse
 import glob
+import io
+import numpy as np
 import os
 import struct
 import tempfile
 import wave
 from collections import deque
 
+from faster_whisper import WhisperModel
 from flask import Flask, jsonify, render_template_string, request, send_file
 
 app = Flask(__name__)
 LOG_DIR = "logs"
 RECORD_DIR = None
 FEED_NAMES = {}
+_LARGE_MODEL = None
+
+
+def get_large_model():
+    """Lazy-load whisper large-v3 on first use."""
+    global _LARGE_MODEL
+    if _LARGE_MODEL is None:
+        print("Loading whisper large-v3 for verification...", flush=True)
+        _LARGE_MODEL = WhisperModel("large-v3", device="cpu", compute_type="int8")
+        print("large-v3 loaded.", flush=True)
+    return _LARGE_MODEL
 
 
 def discover_feeds():
@@ -122,48 +136,42 @@ def get_recording(name):
     return send_file(p, mimetype="audio/wav", conditional=True)
 
 
-@app.route("/clip/<name>")
-def get_clip(name):
-    """Extract a short segment from a WAV chunk.
+def extract_pcm(name, args):
+    """Extract raw PCM frames from a WAV chunk.
 
-    Query params (time mode): start (sec), end (sec).
-    Query params (byte mode): offset (bytes), length (bytes).
-    Returns a standalone WAV.
+    Returns (frames_bytes, rate, channels, sampwidth) or None on error.
+    Uses 'offset'/'length' (byte mode) or 'start'/'end' (time mode) from args.
     """
     if not RECORD_DIR or "/" in name or os.path.basename(name) != name:
-        return ("", 404)
+        return None
     p = os.path.join(RECORD_DIR, name)
     if not os.path.exists(p):
-        return ("", 404)
+        return None
 
     with wave.open(p, "rb") as wf:
         rate = wf.getframerate()
         channels = wf.getnchannels()
         sampwidth = wf.getsampwidth()
 
-        if "offset" in request.args:
-            # byte mode: extract by raw byte offset and length
+        if "offset" in args:
             try:
-                byte_off = int(request.args.get("offset", 0))
-                byte_len = int(request.args.get("length", 64000))
+                byte_off = int(args.get("offset", 0))
+                byte_len = int(args.get("length", 64000))
             except ValueError:
-                return ("", 400)
-            # align to frame boundary (sampwidth * channels bytes per frame)
+                return None
             frame_size = sampwidth * channels
-            start_frame = (byte_off // frame_size) * frame_size // frame_size
             wf.setpos(byte_off // frame_size)
             total_frames = wf.getnframes()
             n_frames = min(byte_len // frame_size, total_frames - (byte_off // frame_size))
             frames = wf.readframes(n_frames)
         else:
-            # time mode: extract by seconds
             try:
-                start = max(0, float(request.args.get("start", 0)))
-                end = float(request.args.get("end", start + 4))
+                start = max(0, float(args.get("start", 0)))
+                end = float(args.get("end", start + 4))
             except ValueError:
-                return ("", 400)
+                return None
             if end <= start:
-                return ("", 400)
+                return None
             total = wf.getnframes()
             duration = total / rate
             start_frame = int(min(start, duration) * rate)
@@ -173,6 +181,17 @@ def get_clip(name):
                 start_frame = max(0, end_frame - int(4 * rate))
             wf.setpos(start_frame)
             frames = wf.readframes(end_frame - start_frame)
+
+    return (frames, rate, channels, sampwidth)
+
+
+@app.route("/clip/<name>")
+def get_clip(name):
+    """Extract a short segment from a WAV chunk and return as WAV."""
+    result = extract_pcm(name, request.args)
+    if not result:
+        return ("", 404)
+    frames, rate, channels, sampwidth = result
 
     # Write to temp file so send_file gets a real file with full seek support
     fd, tmp = tempfile.mkstemp(suffix=".wav")
@@ -197,6 +216,33 @@ def get_clip(name):
         return response
 
     return send_file(tmp, mimetype="audio/wav", download_name="clip.wav", as_attachment=False)
+
+
+@app.route("/verify/<name>", methods=["POST"])
+def verify_clip(name):
+    """Run whisper large-v3 on a clip and return the transcription."""
+    result = extract_pcm(name, request.args)
+    if not result:
+        return jsonify({"error": "clip not found"}), 404
+    frames, rate, channels, sampwidth = result
+
+    samples = np.frombuffer(frames, dtype=np.int16).astype(np.float32) / 32768.0
+    if len(samples) == 0:
+        return jsonify({"text": "", "confidence": 0})
+
+    model = get_large_model()
+    segments, _ = model.transcribe(samples, beam_size=5, vad_filter=True)
+    segs = list(segments)
+    text = " ".join(s.text.strip() for s in segs).strip()
+
+    if segs:
+        avg_lp = sum(s.avg_logprob for s in segs) / len(segs)
+        ns = max(s.no_speech_prob for s in segs)
+    else:
+        avg_lp, ns = 0.0, 0.0
+    conf = max(0.0, min(100.0, 100.0 * (1.0 + avg_lp) * (1.0 - ns)))
+
+    return jsonify({"text": text, "confidence": round(conf)})
 
 
 @app.route("/api/feeds")
@@ -257,6 +303,9 @@ HTML = """
     #player .ptime { font-size: 12px; color: #9aa0a6; min-width: 70px; text-align: center; }
     #player .pbar { flex: 1; height: 6px; background: #2a2f3a; border-radius: 3px; cursor: pointer; position: relative; }
     #player .pbar-fill { height: 100%; background: #70A0AF; border-radius: 3px; width: 0%; transition: width 0.1s linear; }
+    #player .vbtn { cursor: pointer; background: #2d4a2d; border: none; color: #e6e6e6; border-radius: 6px; padding: 8px 12px; font-size: 14px; white-space: nowrap; }
+    #player .vbtn:disabled { opacity: 0.4; cursor: default; }
+    #player .vresult { font-size: 13px; color: #90b890; max-width: 500px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   </style>
 </head>
 <body>
@@ -275,6 +324,8 @@ HTML = """
     <button class="pbtn" id="pbtn" disabled>&#9654; Play</button>
     <div class="pbar" id="pbar"><div class="pbar-fill" id="pbarFill"></div></div>
     <span class="ptime" id="ptime">0:00 / 0:00</span>
+    <button class="vbtn" id="vbtn" disabled>&#128269; Verify</button>
+    <span class="vresult" id="vresult"></span>
     <span class="pclose" onclick="closePlayer()">&#10006;</span>
   </div>
   <script>
@@ -287,10 +338,13 @@ HTML = """
     const pbar = document.getElementById('pbar');
     const pbarFill = document.getElementById('pbarFill');
     const ptime = document.getElementById('ptime');
+    const vbtn = document.getElementById('vbtn');
+    const vresult = document.getElementById('vresult');
     let page = 0;
     let audioCtx = null;
     let currentSrc = null;
     let currentBuffer = null;
+    let currentClipUrl = null;  // the /clip/ URL for verify
     let playingSrc = null;
     let playStartOffset = 0;
     let playStartTime = 0;
@@ -395,7 +449,10 @@ HTML = """
       ptime.textContent = '0:00 / 0:00';
       pbarFill.style.width = '0%';
       currentSrc = url;
+      currentClipUrl = url;  // save for verify
       currentBuffer = null;
+      vbtn.disabled = true;
+      vresult.textContent = '';
 
       try {
         if (!audioCtx) {
@@ -409,12 +466,37 @@ HTML = """
         pbtn.disabled = false;
         pbtn.innerHTML = '&#9654; Play';
         ptime.textContent = '0:00 / ' + fmtTime(clipDuration);
+        vbtn.disabled = false;
       } catch(e) {
         pbtn.innerHTML = 'Error';
         ptime.textContent = 'Failed to load';
         console.error('clip error', e);
       }
     }
+
+    vbtn.addEventListener('click', async () => {
+      if (!currentClipUrl) return;
+      vbtn.disabled = true;
+      vbtn.innerHTML = '...';
+      vresult.textContent = '';
+      try {
+        // POST to /verify with same query params as the clip URL
+        const clipPath = currentClipUrl.split('?')[0];
+        const clipQuery = currentClipUrl.split('?')[1] || '';
+        const verifyUrl = clipPath.replace('/clip/', '/verify/') + '?' + clipQuery;
+        const res = await fetch(verifyUrl, { method: 'POST' });
+        const data = await res.json();
+        if (data.error) {
+          vresult.textContent = 'Error: ' + data.error;
+        } else {
+          vresult.textContent = 'large-v3: "' + (data.text || '(empty)') + '" (' + data.confidence + '/100)';
+        }
+      } catch(e) {
+        vresult.textContent = 'Error: ' + e.message;
+      }
+      vbtn.innerHTML = '&#128269; Verify';
+      vbtn.disabled = false;
+    });
 
     window.closePlayer = function() {
       stopPlayback();
