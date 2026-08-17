@@ -20,15 +20,26 @@ FEED_NAMES = {}
 
 
 def discover_feeds():
-    """Return list of {id, name, log_path} for each feed log file."""
+    """Return list of {id, name, log_path} for every configured feed.
+
+    Shows all feeds passed via --feed-names even if they have no log file
+    yet (quiet feed = no transmissions = no log). Also picks up any
+    feed_*.log not covered by --feed-names.
+    """
     feeds = []
+    seen = set()
+    for fid, name in FEED_NAMES.items():
+        path = os.path.join(LOG_DIR, f"feed_{fid}.log")
+        feeds.append({"id": fid, "name": name, "log_path": path})
+        seen.add(fid)
     for path in sorted(glob.glob(os.path.join(LOG_DIR, "feed_*.log"))):
         fid = os.path.basename(path).replace("feed_", "").replace(".log", "")
-        feeds.append({
-            "id": fid,
-            "name": FEED_NAMES.get(fid, f"Feed {fid}"),
-            "log_path": path,
-        })
+        if fid not in seen:
+            feeds.append({
+                "id": fid,
+                "name": FEED_NAMES.get(fid, f"Feed {fid}"),
+                "log_path": path,
+            })
     return feeds
 
 

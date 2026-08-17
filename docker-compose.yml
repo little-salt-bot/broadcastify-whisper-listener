@@ -3,7 +3,9 @@ services:
     build: .
     container_name: bcfy-scanner
     restart: unless-stopped
-    command: ["41286", "1", "40761", "--model", "medium", "--log-dir", "/app/logs", "--feed-names", "41286:Bedford County,1:Phoenix Fire,40761:Lynchburg Fire"]
+    environment:
+      - TZ=America/New_York
+    command: ["41286", "40761", "--model", "medium", "--log-dir", "/app/logs", "--feed-names", "41286:Bedford County,40761:Lynchburg Fire"]
     volumes:
       - bcfy-cache:/app/.cache
       - bcfy-logs:/app/logs
@@ -14,8 +16,10 @@ services:
     build: .
     container_name: bcfy-dashboard
     restart: unless-stopped
+    environment:
+      - TZ=America/New_York
     entrypoint: ["python", "dashboard.py"]
-    command: ["--log-dir", "/app/logs", "--feed-names", "41286:Bedford County,1:Phoenix Fire,40761:Lynchburg Fire", "--port", "8095"]
+    command: ["--log-dir", "/app/logs", "--feed-names", "41286:Bedford County,40761:Lynchburg Fire", "--port", "8095"]
     volumes:
       - bcfy-logs:/app/logs
     networks:
