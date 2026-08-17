@@ -15,6 +15,7 @@ Usage:
 """
 import argparse
 import datetime
+import glob
 import os
 import struct
 import subprocess
@@ -109,11 +110,38 @@ def new_feed_state():
 
 
 class ChunkRecorder:
-    """Writes continuous per-feed audio into :00/:30 WAV chunks."""
+    """Writes continuous per-feed audio into :00/:30 WAV chunks.
 
-    def __init__(self, record_dir: str):
+    Optionally caps total recordings size: when a chunk is finalized and
+    the total exceeds max_bytes, the oldest finalized chunks are deleted
+    until back under the cap. The currently-open chunk is never deleted.
+    """
+
+    def __init__(self, record_dir: str, max_bytes: int = 0):
         self.dir = record_dir
+        self.max_bytes = max_bytes
         os.makedirs(self.dir, exist_ok=True)
+
+    def _prune(self, active_path: str | None = None):
+        """Delete oldest finalized chunks until total <= max_bytes."""
+        if not self.max_bytes:
+            return
+        files = []
+        for p in glob.glob(os.path.join(self.dir, "*.wav")):
+            if p == active_path:
+                continue  # never delete the chunk being written
+            files.append((os.path.getmtime(p), p))
+        files.sort()  # oldest first
+        total = sum(os.path.getsize(p) for _, p in files)
+        for _, p in files:
+            if total <= self.max_bytes:
+                break
+            try:
+                os.remove(p)
+                total -= os.path.getsize(p)
+                print(f"recordings > cap: pruned {os.path.basename(p)}", flush=True)
+            except OSError:
+                pass
 
     def _roll(self, st, feed_id: int, now: datetime.datetime):
         """Close the current chunk and open a new one if the boundary passed."""
@@ -126,6 +154,7 @@ class ChunkRecorder:
         st["rec_f"] = open_wav(path)
         st["rec_path"] = path
         st["rec_start"] = start
+        self._prune(path)
 
     def write(self, st, feed_id: int, pcm: bytes):
         if not pcm:
@@ -137,6 +166,7 @@ class ChunkRecorder:
         if st["rec_f"] is not None:
             finalize_wav(st["rec_f"], st["rec_path"])
             st["rec_f"] = None
+        self._prune()
 
 
 def main():
@@ -151,8 +181,11 @@ def main():
     ap.add_argument("--silence-ms", type=int, default=600,
                     help="silence (ms) that ends a transmission")
     ap.add_argument("--record-dir", default="",
-                    help="if set, save each transmission's audio as a WAV here "
-                         "for later verification (feed_<id>_<ts>.wav)")
+                    help="if set, record continuous audio into :00/:30 WAV chunks "
+                         "here (feed_<id>_<YYYYMMDD_HHMM>.wav)")
+    ap.add_argument("--record-max-gb", type=float, default=0,
+                    help="cap total recordings at this many GB, deleting oldest "
+                         "chunks past the cap (0 = unlimited)")
     args = ap.parse_args()
 
     # feed_id -> human name
@@ -180,7 +213,8 @@ def main():
                 f.write(line + "\n")
 
     feeds = {fid: new_feed_state() for fid in args.feed_ids}
-    recorder = ChunkRecorder(args.record_dir) if args.record_dir else None
+    max_bytes = int(args.record_max_gb * 1024**3) if args.record_max_gb > 0 else 0
+    recorder = ChunkRecorder(args.record_dir, max_bytes=max_bytes) if args.record_dir else None
     print(f"Listening to feeds {args.feed_ids} ... (Ctrl-C to stop)", flush=True)
 
     try:
