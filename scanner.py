@@ -229,7 +229,7 @@ def main():
         if text:
             ts = stream_ts.strftime("%Y-%m-%d %H:%M:%S")
             name = feed_names.get(feed_id, f"feed {feed_id}")
-            line = f"[{ts}] {text} confidence = {conf:.0f}"
+            line = f"[{ts}] {text} confidence = {conf:.0f}/100"
             print(f"[{name}] {line}", flush=True)
             with open(os.path.join(args.log_dir, f"feed_{feed_id}.log"), "a") as f:
                 f.write(line + "\n")
