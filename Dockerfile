@@ -3,16 +3,13 @@
 
 FROM python:3.12-slim
 
-# ffmpeg needed to decode HLS .ts segments to PCM
-RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg \
-    && rm -rf /var/lib/apt/lists/*
-
+# PyAV bundles its own ffmpeg libs — no system ffmpeg needed
 WORKDIR /app
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY scanner.py dashboard.py .
+COPY scanner.py dashboard.py capture.py ./
 
 # Whisper model cache and log output live here; mount volumes to persist
 ENV HF_HOME=/app/.cache

@@ -14,14 +14,16 @@ Usage:
     python3 scanner.py 41286 1 32602
 """
 import argparse
+import collections
 import datetime
 import glob
+import io
 import os
 import struct
-import subprocess
 import sys
 import time
 
+import av
 import httpx
 import numpy as np
 import webrtcvad
@@ -53,13 +55,21 @@ def get_segments(client: httpx.Client, base: str, playlist: str) -> list[str]:
 
 
 def decode_pcm(segments: list[bytes]) -> bytes:
-    """Concatenate .ts segments and decode to 16kHz mono PCM via ffmpeg stdin."""
-    ff = subprocess.Popen(
-        ["ffmpeg", "-loglevel", "error", "-f", "mpegts", "-i", "pipe:0",
-         "-ar", str(SAMPLE_RATE), "-ac", "1", "-f", "s16le", "-"],
-        stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-    )
-    return ff.communicate(b"".join(segments))[0]
+    """Decode TS segments to 16kHz mono 16-bit PCM using PyAV (in-process)."""
+    data = b"".join(segments)
+    if not data:
+        return b""
+    pcm = bytearray()
+    try:
+        container = av.open(io.BytesIO(data), mode="r", metadata_errors="ignore")
+        resampler = av.AudioResampler(format="s16", layout="mono", rate=SAMPLE_RATE)
+        for frame in container.decode(audio=0):
+            for rf in resampler.resample(frame):
+                pcm.extend(rf.to_ndarray().tobytes())
+        container.close()
+    except Exception as e:
+        print(f"decode_pcm error: {e}", flush=True)
+    return bytes(pcm)
 
 
 def open_wav(path: str):
@@ -97,7 +107,7 @@ def new_feed_state():
     """Per-feed streaming state (buffer, VAD, seen segments)."""
     return {
         "client": httpx.Client(http2=True, headers={"User-Agent": UA}, timeout=30),
-        "seen": set(),
+        "seen": collections.OrderedDict(),  # url -> None, ordered by insertion
         "buf": b"",
         "speech": b"",
         "silence_frames": 0,
@@ -259,7 +269,7 @@ def main():
                         r = st["client"].get(u)
                         if r.status_code == 200 and r.content[:1] == b"\x47":  # TS sync byte
                             seg_data.append(r.content)
-                            st["seen"].add(u)
+                            st["seen"][u] = None
                         time.sleep(0.3)  # don't hammer segment fetches
                     except Exception:
                         pass
@@ -295,9 +305,9 @@ def main():
                             st["silence_frames"] = 0
                             st["tx_start_ts"] = None
 
-                # keep seen bounded
-                if len(st["seen"]) > 200:
-                    st["seen"] = set(list(st["seen"])[-100:])
+                # keep seen bounded (evict oldest entries)
+                while len(st["seen"]) > 200:
+                    st["seen"].popitem(last=False)
 
             time.sleep(1)  # pace the round-robin across feeds
 

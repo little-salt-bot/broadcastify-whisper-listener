@@ -3,3 +3,4 @@ webrtcvad-wheels>=2.0.10
 numpy>=1.26
 httpx[http2]>=0.27
 flask>=3.0
+av>=12.0

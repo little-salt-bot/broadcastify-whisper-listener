@@ -6,6 +6,10 @@ services:
     environment:
       - TZ=America/New_York
     command: ["41286", "40761", "--model", "medium", "--log-dir", "/app/logs", "--record-dir", "/app/recordings", "--record-max-gb", "3", "--feed-names", "41286:Bedford County,40761:Lynchburg Fire"]
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
     volumes:
       - bcfy-cache:/app/.cache
       - bcfy-logs:/app/logs

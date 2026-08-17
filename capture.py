@@ -4,12 +4,11 @@
 Usage: python capture.py FEED_ID OUT.wav [--silence-ms 600]
 """
 import argparse
-import datetime
-import subprocess
-import sys
+import io
 import time
 import wave
 
+import av
 import httpx
 import webrtcvad
 
@@ -32,14 +31,21 @@ def get_segments(base, playlist):
 
 
 def decode_pcm(segments):
-    ff = subprocess.Popen(
-        ["ffmpeg", "-loglevel", "error", "-f", "mpegts", "-i", "pipe:0",
-         "-ar", str(SAMPLE_RATE), "-ac", "1", "-f", "s16le", "-"],
-        stdin=subprocess.PIPE, stdout=subprocess.PIPE)
-    for seg in segments:
-        ff.stdin.write(seg)
-    ff.stdin.close()
-    return ff.stdout.read()
+    """Decode TS segments to 16kHz mono 16-bit PCM using PyAV."""
+    data = b"".join(segments)
+    if not data:
+        return b""
+    pcm = bytearray()
+    try:
+        container = av.open(io.BytesIO(data), mode="r", metadata_errors="ignore")
+        resampler = av.AudioResampler(format="s16", layout="mono", rate=SAMPLE_RATE)
+        for frame in container.decode(audio=0):
+            for rf in resampler.resample(frame):
+                pcm.extend(rf.to_ndarray().tobytes())
+        container.close()
+    except Exception as e:
+        print(f"decode error: {e}", flush=True)
+    return bytes(pcm)
 
 
 def main():
@@ -71,12 +77,12 @@ def main():
                 time.sleep(5)
                 continue
 
-            data = b""
+            data = []
             for u in new:
                 try:
                     r = client.get(u)
                     if r.status_code == 200 and r.content[:1] == b"\x47":
-                        data += r.content
+                        data.append(r.content)
                         seen.add(u)
                     time.sleep(0.3)
                 except Exception:
@@ -85,7 +91,7 @@ def main():
                 time.sleep(5)
                 continue
 
-            pcm = decode_pcm([data])
+            pcm = decode_pcm(data)
             buf += pcm
             while len(buf) >= FRAME_BYTES:
                 frame = buf[:FRAME_BYTES]

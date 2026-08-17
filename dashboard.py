@@ -11,6 +11,7 @@ Usage:
 import argparse
 import glob
 import os
+from collections import deque
 
 from flask import Flask, jsonify, render_template_string, request, send_file
 
@@ -52,23 +53,36 @@ def read_log(path, limit=200, date=None, page=0):
           etc. page=-1 means "no pagination, just last `limit` overall"
           (used by the live auto-refresh view).
     Returns (text, has_more) where has_more is True if older lines remain.
+
+    Uses deque to avoid reading the entire file into memory — only keeps
+    the relevant window. For date-filtered reads it still scans the file
+    once (prefix match) but only retains matching lines in memory.
     """
     try:
         with open(path, "r") as f:
-            lines = f.readlines()
+            if date:
+                # date filter: scan once, keep only matching lines
+                lines = [l for l in f if l.startswith(f"[{date}")]
+                if page == -1:
+                    return "".join(lines[-limit:]), False
+                start = max(0, len(lines) - limit * (page + 1))
+                end = len(lines) - limit * page
+                has_more = start > 0
+                return "".join(lines[start:end]), has_more
+            else:
+                # no date filter: use deque to tail the file efficiently
+                if page == -1 or page == 0:
+                    lines = list(deque(f, maxlen=limit))
+                    return "".join(lines), False
+                # for older pages without date, we need more lines
+                needed = limit * (page + 1)
+                lines = list(deque(f, maxlen=needed))
+                start = max(0, len(lines) - limit * (page + 1))
+                end = len(lines) - limit * page
+                has_more = len(lines) >= needed
+                return "".join(lines[start:end]), has_more
     except FileNotFoundError:
         return "", False
-    if not lines:
-        return "", False
-    if date:
-        lines = [l for l in lines if l.startswith(f"[{date}")]
-    if page == -1:
-        return "".join(lines[-limit:]), False
-    # page 0 = latest; slice from the end
-    start = max(0, len(lines) - limit * (page + 1))
-    end = len(lines) - limit * page
-    has_more = start > 0
-    return "".join(lines[start:end]), has_more
 
 
 @app.route("/")
@@ -238,7 +252,7 @@ def main():
             FEED_NAMES[fid.strip()] = name.strip()
 
     print(f"Dashboard on http://0.0.0.0:{args.port} (logs: {LOG_DIR})", flush=True)
-    app.run(host="0.0.0.0", port=args.port)
+    app.run(host="0.0.0.0", port=args.port, threaded=True)
 
 
 if __name__ == "__main__":
