@@ -1,0 +1,30 @@
+services:
+  scanner:
+    build: .
+    container_name: bcfy-scanner
+    restart: unless-stopped
+    command: ["41286", "1", "--model", "medium", "--log-dir", "/app/logs", "--feed-names", "41286:Bedford County,1:Phoenix Fire"]
+    volumes:
+      - bcfy-cache:/app/.cache
+      - bcfy-logs:/app/logs
+    networks:
+      - traefik-net
+
+  dashboard:
+    build: .
+    container_name: bcfy-dashboard
+    restart: unless-stopped
+    entrypoint: ["python", "dashboard.py"]
+    command: ["--log-dir", "/app/logs", "--feed-names", "41286:Bedford County,1:Phoenix Fire", "--port", "8095"]
+    volumes:
+      - bcfy-logs:/app/logs
+    networks:
+      - traefik-net
+
+volumes:
+  bcfy-cache:
+  bcfy-logs:
+
+networks:
+  traefik-net:
+    external: true
