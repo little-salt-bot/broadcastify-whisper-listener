@@ -116,7 +116,7 @@ def get_recording(name):
     p = os.path.join(RECORD_DIR, name)
     if not os.path.exists(p):
         return ("", 404)
-    return send_file(p, mimetype="audio/wav")
+    return send_file(p, mimetype="audio/wav", conditional=True)
 
 
 @app.route("/api/feeds")
@@ -156,6 +156,9 @@ HTML = """
     .channel { background: #161a22; border: 1px solid #2a2f3a; border-radius: 8px; overflow: hidden; display: flex; flex-direction: column; }
     .channel h2 { margin: 0; padding: 12px 16px; font-size: 15px; background: #1c212b; border-bottom: 1px solid #2a2f3a; }
     .channel pre { margin: 0; padding: 12px 16px; font-size: 13px; line-height: 1.5; white-space: pre-wrap; word-wrap: break-word; height: 420px; overflow-y: auto; box-sizing: border-box; }
+    .tline { cursor: pointer; padding: 2px 4px; border-radius: 4px; display: block; }
+    .tline:hover { background: #1c212b; }
+    .tline.selected { background: #233055; }
     .empty { color: #6b7280; font-style: italic; }
     .foot { color: #6b7280; font-size: 12px; padding: 8px 16px; border-top: 1px solid #2a2f3a; display: flex; justify-content: space-between; align-items: center; }
     .foot button { background: #1c212b; color: #e6e6e6; border: 1px solid #2a2f3a; padding: 4px 10px; border-radius: 6px; cursor: pointer; font-size: 12px; }
@@ -165,6 +168,10 @@ HTML = """
     .rec-list audio { display: block; margin-top: 6px; height: 32px; }
     .rec-meta { color: #6b7280; font-size: 11px; margin-top: 4px; }
     .hidden { display: none; }
+    #player { position: fixed; bottom: 0; left: 0; right: 0; background: #161a22; border-top: 1px solid #2a2f3a; padding: 12px 24px; display: none; align-items: center; gap: 16px; }
+    #player audio { flex: 1; height: 36px; }
+    #player .plabel { font-size: 13px; color: #9aa0a6; min-width: 200px; max-width: 400px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    #player .pclose { cursor: pointer; color: #6b7280; font-size: 18px; }
   </style>
 </head>
 <body>
@@ -178,36 +185,89 @@ HTML = """
     <ul class="rec-list" id="recList"></ul>
   </div>
   <div class="grid" id="grid"></div>
+  <div id="player">
+    <span class="plabel" id="plabel"></span>
+    <audio id="paudio" controls preload="auto"></audio>
+    <span class="pclose" onclick="closePlayer()">&#10006;</span>
+  </div>
   <script>
     const datePicker = document.getElementById('datePicker');
     const prevBtn = document.getElementById('prevBtn');
     const pageLabel = document.getElementById('pageLabel');
+    const player = document.getElementById('player');
+    const paudio = document.getElementById('paudio');
+    const plabel = document.getElementById('plabel');
     let page = 0;
 
     datePicker.value = new Date().toISOString().slice(0, 10);
     datePicker.addEventListener('change', () => { page = 0; refresh(); loadRecordings(); });
     prevBtn.addEventListener('click', () => { page += 1; refresh(); });
 
+    function tsToChunk(feedId, ts) {
+      // ts = "2026-08-17 07:18:57" -> chunk "feed_<id>_20260817_07" + "00" or "30"
+      // offset = seconds into the 30-min chunk
+      const d = new Date(ts.replace(' ', 'T'));
+      const mm = d.getMinutes();
+      const ss = d.getSeconds();
+      const chunkMM = mm < 30 ? '00' : '30';
+      const chunk = `feed_${feedId}_${d.getFullYear()}${String(d.getMonth()+1).padStart(2,'0')}${String(d.getDate()).padStart(2,'0')}_${String(d.getHours()).padStart(2,'0')}${chunkMM}`;
+      const offset = (mm < 30 ? mm : mm - 30) * 60 + ss;
+      return { chunk, offset };
+    }
+
+    function playClip(feedId, ts, text) {
+      const { chunk, offset } = tsToChunk(feedId, ts);
+      const url = `/recordings/${chunk}.wav`;
+      plabel.textContent = text.slice(0, 80);
+      player.style.display = 'flex';
+      paudio.src = url;
+      paudio.load();
+      paudio.onloadedmetadata = () => {
+        paudio.currentTime = offset;
+        paudio.play().catch(() => {});
+      };
+    }
+
+    window.closePlayer = function() {
+      paudio.pause();
+      player.style.display = 'none';
+      document.querySelectorAll('.tline.selected').forEach(el => el.classList.remove('selected'));
+    };
+
     async function refresh() {
       const date = datePicker.value;
       const res = await fetch('/api/feeds?date=' + date + '&page=' + page);
       const feeds = await res.json();
       const grid = document.getElementById('grid');
-      grid.innerHTML = feeds.map(f => `
-        <div class="channel">
+      grid.innerHTML = feeds.map(f => {
+        if (!f.log) {
+          return `<div class="channel">
+            <h2>${f.name}</h2>
+            <pre><span class="empty">No transmissions this day</span></pre>
+            <div class="foot"><span>Updated ${new Date().toLocaleTimeString()}</span>${f.has_more ? '<button onclick="loadOlder()">Older &#9664;</button>' : ''}</div>
+          </div>`;
+        }
+        // parse each line: [YYYY-MM-DD HH:MM:SS] text confidence = N/100
+        const lines = f.log.split('\\n').filter(l => l.trim());
+        const html = lines.map(l => {
+          const m = l.match(/^\\[(\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}:\\d{2})\\]\\s*(.*)$/);
+          if (!m) return `<span class="tline">${l.replace(/</g, '&lt;')}</span>`;
+          const ts = m[1];
+          const text = m[2].replace(/</g, '&lt;');
+          return `<span class="tline" onclick="playClip('${f.id}', '${ts}', '${text.replace(/'/g, "\\'")}')">${l.replace(/</g, '&lt;')}</span>`;
+        }).join('');
+        return `<div class="channel">
           <h2>${f.name}</h2>
-          <pre>${f.log ? f.log.replace(/</g, '&lt;') : '<span class="empty">No transmissions this day</span>'}</pre>
-          <div class="foot">
-            <span>Updated ${new Date().toLocaleTimeString()}</span>
-            ${f.has_more ? '<button onclick="loadOlder()">Older &#9664;</button>' : ''}
-          </div>
-        </div>
-      `).join('');
+          <pre>${html}</pre>
+          <div class="foot"><span>Updated ${new Date().toLocaleTimeString()}</span>${f.has_more ? '<button onclick="loadOlder()">Older &#9664;</button>' : ''}</div>
+        </div>`;
+      }).join('');
       pageLabel.textContent = page;
       prevBtn.disabled = (page === 0);
     }
 
     window.loadOlder = function() { page += 1; refresh(); };
+    window.playClip = playClip;
 
     async function loadRecordings() {
       const date = datePicker.value;
