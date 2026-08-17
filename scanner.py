@@ -57,10 +57,7 @@ def decode_pcm(segments: list[bytes]) -> bytes:
          "-ar", str(SAMPLE_RATE), "-ac", "1", "-f", "s16le", "-"],
         stdin=subprocess.PIPE, stdout=subprocess.PIPE,
     )
-    for seg in segments:
-        ff.stdin.write(seg)
-    ff.stdin.close()
-    return ff.stdout.read()
+    return ff.communicate(b"".join(segments))[0]
 
 
 def new_feed_state():
