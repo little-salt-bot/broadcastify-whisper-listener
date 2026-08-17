@@ -217,14 +217,19 @@ HTML = """
 
     function playClip(feedId, ts, text) {
       const { chunk, offset } = tsToChunk(feedId, ts);
-      const url = `/recordings/${chunk}.wav`;
+      const start = Math.max(0, offset - 2);
+      const end = offset + 2;
+      const url = `/recordings/${chunk}.wav#t=${start},${end}`;
       plabel.textContent = text.slice(0, 80);
       player.style.display = 'flex';
       paudio.src = url;
       paudio.load();
       paudio.onloadedmetadata = () => {
-        paudio.currentTime = offset;
+        paudio.currentTime = start;
         paudio.play().catch(() => {});
+      };
+      paudio.ontimeupdate = () => {
+        if (paudio.currentTime >= end) { paudio.pause(); }
       };
     }
 
