@@ -10,9 +10,9 @@ Usage:
 """
 import argparse
 import glob
-import io
 import os
 import struct
+import tempfile
 import wave
 from collections import deque
 
@@ -157,18 +157,26 @@ def get_clip(name):
         wf.setpos(start_frame)
         frames = wf.readframes(end_frame - start_frame)
 
-    buf = io.BytesIO()
-    with wave.open(buf, "wb") as out:
-        out.setframerate(rate)
-        out.setnchannels(channels)
-        out.setsampwidth(sampwidth)
-        out.writeframes(frames)
-    buf.seek(0)
-    return send_file(
-        buf,
-        mimetype="audio/wav",
-        as_attachment=False,
-    )
+    # Write to temp file so send_file gets a real file with full seek support
+    fd, tmp = tempfile.mkstemp(suffix=".wav")
+    with os.fdopen(fd, "wb") as f:
+        with wave.open(f, "wb") as out:
+            out.setframerate(rate)
+            out.setnchannels(channels)
+            out.setsampwidth(sampwidth)
+            out.writeframes(frames)
+
+    from flask import after_this_request
+
+    @after_this_request
+    def cleanup(response):
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        return response
+
+    return send_file(tmp, mimetype="audio/wav", download_name="clip.wav", as_attachment=False)
 
 
 @app.route("/api/feeds")
@@ -224,6 +232,11 @@ HTML = """
     #player audio { flex: 1; height: 36px; }
     #player .plabel { font-size: 13px; color: #9aa0a6; min-width: 200px; max-width: 400px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     #player .pclose { cursor: pointer; color: #6b7280; font-size: 18px; }
+    #player .pbtn { cursor: pointer; background: #233055; border: none; color: #e6e6e6; border-radius: 6px; padding: 8px 12px; font-size: 14px; white-space: nowrap; }
+    #player .pbtn:disabled { opacity: 0.4; cursor: default; }
+    #player .ptime { font-size: 12px; color: #9aa0a6; min-width: 70px; text-align: center; }
+    #player .pbar { flex: 1; height: 6px; background: #2a2f3a; border-radius: 3px; cursor: pointer; position: relative; }
+    #player .pbar-fill { height: 100%; background: #70A0AF; border-radius: 3px; width: 0%; transition: width 0.1s linear; }
   </style>
 </head>
 <body>
@@ -239,7 +252,9 @@ HTML = """
   <div class="grid" id="grid"></div>
   <div id="player">
     <span class="plabel" id="plabel"></span>
-    <audio id="paudio" controls preload="auto"></audio>
+    <button class="pbtn" id="pbtn" disabled>&#9654; Play</button>
+    <div class="pbar" id="pbar"><div class="pbar-fill" id="pbarFill"></div></div>
+    <span class="ptime" id="ptime">0:00 / 0:00</span>
     <span class="pclose" onclick="closePlayer()">&#10006;</span>
   </div>
   <script>
@@ -247,17 +262,32 @@ HTML = """
     const prevBtn = document.getElementById('prevBtn');
     const pageLabel = document.getElementById('pageLabel');
     const player = document.getElementById('player');
-    const paudio = document.getElementById('paudio');
     const plabel = document.getElementById('plabel');
+    const pbtn = document.getElementById('pbtn');
+    const pbar = document.getElementById('pbar');
+    const pbarFill = document.getElementById('pbarFill');
+    const ptime = document.getElementById('ptime');
     let page = 0;
+    let audioCtx = null;
+    let currentSrc = null;
+    let currentBuffer = null;
+    let playingSrc = null;
+    let playStartOffset = 0;
+    let playStartTime = 0;
+    let clipDuration = 0;
+    let rafId = null;
 
     datePicker.value = new Date().toISOString().slice(0, 10);
     datePicker.addEventListener('change', () => { page = 0; refresh(); loadRecordings(); });
     prevBtn.addEventListener('click', () => { page += 1; refresh(); });
 
+    function fmtTime(s) {
+      const m = Math.floor(s / 60);
+      const sec = Math.floor(s % 60);
+      return m + ':' + String(sec).padStart(2, '0');
+    }
+
     function tsToChunk(feedId, ts) {
-      // ts = "2026-08-17 07:18:57" -> chunk "feed_<id>_20260817_07" + "00" or "30"
-      // offset = seconds into the 30-min chunk
       const d = new Date(ts.replace(' ', 'T'));
       const mm = d.getMinutes();
       const ss = d.getSeconds();
@@ -267,19 +297,100 @@ HTML = """
       return { chunk, offset };
     }
 
-    function playClip(feedId, ts, text) {
+    function stopPlayback() {
+      if (playingSrc) { try { playingSrc.stop(); } catch(e){} playingSrc = null; }
+      if (rafId) { cancelAnimationFrame(rafId); rafId = null; }
+      pbtn.innerHTML = '&#9654; Play';
+    }
+
+    function updateProgress() {
+      if (!playingSrc) return;
+      const elapsed = playStartOffset + (audioCtx.currentTime - playStartTime);
+      if (elapsed >= clipDuration) {
+        stopPlayback();
+        pbarFill.style.width = '100%';
+        ptime.textContent = fmtTime(clipDuration) + ' / ' + fmtTime(clipDuration);
+        return;
+      }
+      pbarFill.style.width = (elapsed / clipDuration * 100) + '%';
+      ptime.textContent = fmtTime(elapsed) + ' / ' + fmtTime(clipDuration);
+      rafId = requestAnimationFrame(updateProgress);
+    }
+
+    function startPlayback(offset) {
+      stopPlayback();
+      if (!currentBuffer || !audioCtx) return;
+      playingSrc = audioCtx.createBufferSource();
+      playingSrc.buffer = currentBuffer;
+      playingSrc.connect(audioCtx.destination);
+      playStartOffset = offset || 0;
+      playStartTime = audioCtx.currentTime;
+      playingSrc.start(0, playStartOffset);
+      playingSrc.onended = () => { if (playingSrc) { stopPlayback(); } };
+      pbtn.innerHTML = '&#9646;&#9646; Pause';
+      updateProgress();
+    }
+
+    pbtn.addEventListener('click', () => {
+      if (!audioCtx) {
+        audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      }
+      if (audioCtx.state === 'suspended') { audioCtx.resume(); }
+      if (playingSrc) {
+        stopPlayback();
+        pbarFill.style.width = (playStartOffset / clipDuration * 100) + '%';
+        ptime.textContent = fmtTime(playStartOffset) + ' / ' + fmtTime(clipDuration);
+      } else {
+        startPlayback(playStartOffset >= clipDuration ? 0 : playStartOffset);
+      }
+    });
+
+    pbar.addEventListener('click', (e) => {
+      if (!currentBuffer) return;
+      const rect = pbar.getBoundingClientRect();
+      const pct = (e.clientX - rect.left) / rect.width;
+      const seekTo = pct * clipDuration;
+      if (playingSrc) { startPlayback(seekTo); } 
+      else { playStartOffset = seekTo; pbarFill.style.width = (pct*100)+'%'; ptime.textContent = fmtTime(seekTo) + ' / ' + fmtTime(clipDuration); }
+    });
+
+    async function playClip(feedId, ts, text) {
       const { chunk, offset } = tsToChunk(feedId, ts);
       const start = Math.max(0, offset - 2);
       const end = offset + 2;
       const url = `/clip/${chunk}.wav?start=${start}&end=${end}`;
       plabel.textContent = text.slice(0, 80);
       player.style.display = 'flex';
-      paudio.src = url;
-      paudio.play().catch(() => {});
+      stopPlayback();
+      pbtn.disabled = true;
+      pbtn.innerHTML = '...';
+      ptime.textContent = '0:00 / 0:00';
+      pbarFill.style.width = '0%';
+      currentSrc = url;
+
+      try {
+        if (!audioCtx) {
+          audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        }
+        const res = await fetch(url);
+        const buf = await res.arrayBuffer();
+        currentBuffer = await audioCtx.decodeAudioData(buf);
+        clipDuration = currentBuffer.duration;
+        playStartOffset = 0;
+        pbtn.disabled = false;
+        pbtn.innerHTML = '&#9654; Play';
+        ptime.textContent = '0:00 / ' + fmtTime(clipDuration);
+        // autoplay
+        startPlayback(0);
+      } catch(e) {
+        pbtn.innerHTML = 'Error';
+        ptime.textContent = 'Failed to load';
+        console.error('clip error', e);
+      }
     }
 
     window.closePlayer = function() {
-      paudio.pause();
+      stopPlayback();
       player.style.display = 'none';
       document.querySelectorAll('.tline.selected').forEach(el => el.classList.remove('selected'));
     };
