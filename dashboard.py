@@ -254,7 +254,7 @@ HTML = """
           if (!m) return `<span class="tline">${l.replace(/</g, '&lt;')}</span>`;
           const ts = m[1];
           const text = m[2].replace(/</g, '&lt;');
-          return `<span class="tline" onclick="playClip('${f.id}', '${ts}', '${text.replace(/'/g, "\\'")}')">${l.replace(/</g, '&lt;')}</span>`;
+          return `<span class="tline" data-feed="${f.id}" data-ts="${ts}">${l.replace(/</g, '&lt;')}</span>`;
         }).join('');
         return `<div class="channel">
           <h2>${f.name}</h2>
@@ -267,7 +267,17 @@ HTML = """
     }
 
     window.loadOlder = function() { page += 1; refresh(); };
-    window.playClip = playClip;
+    // delegated click handler for transcript lines
+    document.addEventListener('click', (e) => {
+      const el = e.target.closest('.tline');
+      if (!el || !el.dataset.feed) return;
+      document.querySelectorAll('.tline.selected').forEach(s => s.classList.remove('selected'));
+      el.classList.add('selected');
+      const feedId = el.dataset.feed;
+      const ts = el.dataset.ts;
+      const text = el.textContent.replace(/^\[.*?\]\s*/, '').slice(0, 80);
+      playClip(feedId, ts, text);
+    });
 
     async function loadRecordings() {
       const date = datePicker.value;
