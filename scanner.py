@@ -15,6 +15,7 @@ Usage:
 """
 import argparse
 import datetime
+import os
 import subprocess
 import sys
 import time
@@ -81,10 +82,21 @@ def main():
                     help="Broadcastify feed IDs, e.g. 41286 1 32602")
     ap.add_argument("--model", default="small", help="Whisper model size (tiny/base/small/medium)")
     ap.add_argument("--device", default="auto", help="auto/cpu/cuda")
-    ap.add_argument("--log", default="scanner.log", help="output log file")
+    ap.add_argument("--log-dir", default="logs", help="directory for per-feed log files")
+    ap.add_argument("--feed-names", default="",
+                    help="comma-separated feed_id:name pairs, e.g. 41286:Bedford,1:Phoenix")
     ap.add_argument("--silence-ms", type=int, default=600,
                     help="silence (ms) that ends a transmission")
     args = ap.parse_args()
+
+    # feed_id -> human name
+    feed_names = {}
+    for pair in args.feed_names.split(","):
+        if ":" in pair:
+            fid, name = pair.split(":", 1)
+            feed_names[int(fid)] = name.strip()
+
+    os.makedirs(args.log_dir, exist_ok=True)
 
     model = WhisperModel(args.model, device=args.device, compute_type="int8")
     vad = webrtcvad.Vad(2)
@@ -95,9 +107,10 @@ def main():
         text = " ".join(s.text.strip() for s in segments).strip()
         if text:
             ts = stream_ts.strftime("%Y-%m-%d %H:%M:%S")
-            line = f"[{ts}] [feed {feed_id}] {text}"
-            print(line, flush=True)
-            with open(args.log, "a") as f:
+            name = feed_names.get(feed_id, f"feed {feed_id}")
+            line = f"[{ts}] {text}"
+            print(f"[{name}] {line}", flush=True)
+            with open(os.path.join(args.log_dir, f"feed_{feed_id}.log"), "a") as f:
                 f.write(line + "\n")
 
     feeds = {fid: new_feed_state() for fid in args.feed_ids}

@@ -12,7 +12,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY scanner.py .
+COPY scanner.py dashboard.py .
 
 # Whisper model cache and log output live here; mount volumes to persist
 ENV HF_HOME=/app/.cache

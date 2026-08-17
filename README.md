@@ -45,6 +45,31 @@ docker run -d \
 
 Each transcript is tagged with its feed: `[2026-08-16 15:20:01] [feed 1] 3-5-1-1-2-3-5-9-go ahead`
 
+### Per-feed log files
+
+Logs are written to `--log-dir` (default `logs/`), one file per feed: `feed_<id>.log`. Give feeds human names with `--feed-names`:
+
+```bash
+docker run -d \
+  --name bcfy-listener \
+  -v bcfy-cache:/app/.cache \
+  -v bcfy-logs:/app/logs \
+  broadcastify-whisper-listener 41286 1 \
+    --model medium \
+    --log-dir /app/logs \
+    --feed-names "41286:Bedford County,1:Phoenix Fire"
+```
+
+## Dashboard
+
+A web dashboard shows each feed as a labeled channel with its transcript history, auto-refreshing every 5s:
+
+```bash
+python dashboard.py --log-dir logs --feed-names "41286:Bedford County,1:Phoenix Fire" --port 8081
+```
+
+Open `http://localhost:8081`. Each channel is labeled by feed name and shows that feed's log history. The dashboard reads the same `--log-dir` the scanner writes to, so run both against the same directory.
+
 ### Bare metal
 
 ```bash
@@ -64,7 +89,8 @@ python scanner.py FEED_ID [FEED_ID ...] [options]
 | `FEED_ID ...` | (required) | One or more Broadcastify feed IDs, e.g. `41286 1 32602` |
 | `--model` | `small` | Whisper model size: `tiny`, `base`, `small`, `medium`, `large-v3` |
 | `--device` | `auto` | `auto`, `cpu`, or `cuda` |
-| `--log` | `scanner.log` | Output log file path |
+| `--log-dir` | `logs` | Directory for per-feed log files |
+| `--feed-names` | (none) | Comma-separated `feed_id:name` pairs, e.g. `41286:Bedford,1:Phoenix` |
 | `--silence-ms` | `600` | Silence (ms) that ends a transmission |
 
 ## Model choice
