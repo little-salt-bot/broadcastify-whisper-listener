@@ -203,11 +203,23 @@ def main():
     def transcribe(feed_id: int, audio: bytes, stream_ts: datetime.datetime):
         samples = np.frombuffer(audio, dtype=np.int16).astype(np.float32) / 32768.0
         segments, _ = model.transcribe(samples, beam_size=5, vad_filter=True)
-        text = " ".join(s.text.strip() for s in segments).strip()
+        segs = list(segments)
+        text = " ".join(s.text.strip() for s in segs).strip()
+        # Confidence: whisper exposes avg_logprob (per-token, closer to 0 =
+        # higher confidence) and no_speech_prob (0-1, how likely it's noise).
+        # Average logprob across segments, mapped to a 0-100 confidence.
+        if segs:
+            avg_lp = sum(s.avg_logprob for s in segs) / len(segs)
+            ns = max(s.no_speech_prob for s in segs)
+        else:
+            avg_lp, ns = 0.0, 0.0
+        # logprob -1.0 ~ 0.0 roughly maps to confidence 0-100; penalize
+        # strongly when the model thinks there's no speech.
+        conf = max(0.0, min(100.0, 100.0 * (1.0 + avg_lp) * (1.0 - ns)))
         if text:
             ts = stream_ts.strftime("%Y-%m-%d %H:%M:%S")
             name = feed_names.get(feed_id, f"feed {feed_id}")
-            line = f"[{ts}] {text}"
+            line = f"[{ts}] {text} confidence = {conf:.0f}"
             print(f"[{name}] {line}", flush=True)
             with open(os.path.join(args.log_dir, f"feed_{feed_id}.log"), "a") as f:
                 f.write(line + "\n")
